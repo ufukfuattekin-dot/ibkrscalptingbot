@@ -120,6 +120,160 @@ curl -XPOST localhost:8000/api/v1/backtest \
 Returns metrics (trades, win rate, profit factor, Sharpe, max drawdown,
 return %), trade list, and equity curve.
 
+### Walk-forward (out-of-sample stability)
+
+Single-pass backtests overfit. Walk-forward splits the data into N
+consecutive windows and reports stability across them. A strategy that's
+only good in-sample fails this test.
+
+```bash
+curl -XPOST localhost:8000/api/v1/backtest/walkforward \
+  -H 'Content-Type: application/json' \
+  -d '{"symbol":"PLTR","duration":"180 D","cost_model":"ibkr_pro","n_folds":6}'
+```
+
+Or use the **Walk-Forward** tab on the Backtest page in the dashboard.
+
+### Multi-symbol stability report
+
+Runs walk-forward across many symbols and writes a markdown + JSON
+report. Use this before deploying a strategy to paper trading: a
+strategy that's STABLE on 1 of 10 names is name-specific, not a
+generalizable edge.
+
+**Prereqs:** IB Gateway must be reachable. Set `IB_USERID` /
+`IB_PASSWORD` in `.env` (paper account is fine — `TRADING_MODE=paper`
+points to port 4002 by default), then:
+
+```bash
+docker compose up -d postgres redis ib-gateway backend
+docker compose exec backend python -m app.cli.run_report \
+    --symbols-file data/symbols.txt \
+    --duration "180 D" \
+    --folds 6 \
+    --cost-model ibkr_pro
+
+# or one-off:
+docker compose exec backend python -m app.cli.run_report \
+    --symbols PLTR,SOFI,RIVN,HOOD --duration "120 D" --folds 5
+```
+
+Output lands in `backend/reports/<UTC_TIMESTAMP>/report.md` and
+`report.json`. The markdown is grouped: STABLE symbols first, FRAGILE
+last, with a portfolio verdict at the top:
+
+| % of symbols STABLE | Verdict |
+|---|---|
+| ≥ 60% | ✅ Edge generalizes — proceed to paper trading |
+| 30–60% | ⚠️ Marginal — name-specific edge, no portfolio deploy |
+| < 30% | ❌ Curve-fit, do not deploy |
+
+### Parameter sweep (grid search over engine knobs)
+
+Once walk-forward shows your strategy is at least MIXED, sweep the engine
+knobs to find a more stable configuration. The sweep evaluates each
+combination by walk-forward across multiple symbols, then ranks by a
+stability metric (default: `robust_sharpe = sharpe_mean − 0.5 × sharpe_std`).
+
+**Default grid** (48 combinations):
+
+| Param | Values |
+|---|---|
+| `trail_after_r` | 0.5, 1.0, 1.5, 2.0 |
+| `trail_atr_mult` | 0.75, 1.0, 1.5, 2.0 |
+| `per_trade_risk_pct` | 0.25, 0.5, 1.0 |
+
+**Ranking metrics** (configurable):
+- `robust_sharpe` — Sharpe mean minus 0.5×std (default; rewards consistency)
+- `calmar` — mean return / |worst fold return| (penalizes worst case)
+- `mean_return` — pure mean return
+- `profitable_pct` — % of folds in the green
+
+```bash
+# CLI sweep with the default grid:
+docker compose exec backend python -m app.cli.run_sweep \
+    --symbols-file data/symbols.txt \
+    --duration "180 D" \
+    --folds 5 \
+    --ranking-metric robust_sharpe
+
+# Custom grid via JSON:
+echo '{"trail_after_r":[0.5,1.0,1.5],"trail_atr_mult":[0.75,1.0],"per_trade_risk_pct":[0.25,0.5]}' > grid.json
+docker compose exec backend python -m app.cli.run_sweep \
+    --symbols PLTR,SOFI,RIVN \
+    --grid-file grid.json
+```
+
+Or use the **Param Sweep** tab on the Backtest page in the dashboard.
+Output: `backend/reports/sweep_<UTC_TIMESTAMP>/sweep.{md,json}` with the
+top-N ranked combinations and a per-symbol breakdown of the winner.
+
+> **Multiple-comparisons caveat:** with dozens of combos tried, the top
+> combo's score is biased upward by chance. Treat the top-3 as roughly
+> equivalent and prefer the lowest-variance profile. Re-run on a more
+> recent window to confirm before deploying.
+
+### Strategy-level sweep
+
+The same sweep also tunes per-strategy parameters (RSI oversold threshold,
+EMA `target_r`, momentum `min_rvol`, etc.) — not just engine knobs.
+Grid keys can be **namespaced**:
+
+| Key | Routes to |
+|---|---|
+| `engine.trail_after_r` | `BacktestEngine` kwarg |
+| `momentum.min_rvol` | `MomentumBreakoutStrategy` kwarg |
+| `ema.target_r` | `EmaTrendStrategy` kwarg |
+| `rsi.oversold` | `RsiReversalStrategy` kwarg |
+
+Built-in strategy presets (run one strategy at a time):
+
+```bash
+docker compose exec backend python -m app.cli.run_sweep \
+    --symbols-file data/symbols.txt --duration "180 D" \
+    --strategy-preset rsi --ranking-metric robust_sharpe
+```
+
+In the dashboard's **Param Sweep** tab, the "Sweep Target" dropdown picks
+between the engine knob grid and any strategy preset.
+
+## Observability (Prometheus + Grafana)
+
+The backend exposes Prometheus metrics at `/metrics`. Spin up the full
+stack with Prometheus + Grafana:
+
+```bash
+docker compose up -d prometheus grafana
+```
+
+- **Prometheus:** http://localhost:9090 — query `scalper_account_equity_dollars`, etc.
+- **Grafana:** http://localhost:3000 — anonymous viewer enabled; admin login `admin/admin` (override via `GRAFANA_ADMIN_PASSWORD`).
+- A pre-provisioned dashboard "**Scalper — Live Overview**" is auto-imported
+  into the `Scalper` folder (broker status, equity, PnL, signals/min,
+  rejections by rule, exit-reason mix, scanner latency p50/p95).
+
+Metrics exposed:
+
+| Type | Name | Labels |
+|---|---|---|
+| Gauge | `scalper_broker_connected` | – |
+| Gauge | `scalper_account_equity_dollars` | – |
+| Gauge | `scalper_realized_pnl_today_dollars` | – |
+| Gauge | `scalper_unrealized_pnl_dollars` | – |
+| Gauge | `scalper_open_positions` | – |
+| Gauge | `scalper_circuit_breaker_tripped` | – |
+| Gauge | `scalper_consecutive_losses` | – |
+| Gauge | `scalper_universe_size` | – |
+| Gauge | `scalper_trading_mode_paper` | – |
+| Counter | `scalper_signals_total` | `strategy` |
+| Counter | `scalper_signals_rejected_total` | `rule` |
+| Counter | `scalper_orders_filled_total` | `side` |
+| Counter | `scalper_positions_closed_total` | `reason` |
+| Counter | `scalper_realized_pnl_total_dollars` | – |
+| Counter | `scalper_realized_loss_total_dollars` | – |
+| Counter | `scalper_errors_total` | `level` |
+| Histogram | `scalper_scan_duration_seconds` | – |
+
 ## Tests
 
 ```bash

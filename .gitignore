@@ -25,3 +25,6 @@ dist/
 *.sqlite
 postgres_data/
 redis_data/
+
+# generated reports
+backend/reports/
