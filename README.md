@@ -213,6 +213,35 @@ top-N ranked combinations and a per-symbol breakdown of the winner.
 > equivalent and prefer the lowest-variance profile. Re-run on a more
 > recent window to confirm before deploying.
 
+### Applying a sweep result to live (one-click)
+
+Each row of the sweep result table has an **Apply** button. Click it to
+push those params into the running backend:
+
+- Strategy attributes (`momentum.min_rvol`, `rsi.oversold`, etc.) are
+  mutated on the live strategy instances.
+- Engine knobs (`trail_after_r`, `trail_atr_mult`, `enable_trailing`,
+  `per_trade_risk_pct`) are written into the in-memory `Settings`. The
+  `TrailingManager` and `RiskManager` read from `Settings` per use, so
+  the change is picked up on the next event without a restart.
+- Params are persisted to Postgres (`settings.active_params`) and
+  audited (who, when, which sweep rank/score). On the next backend
+  restart, `ActiveConfig.load()` re-applies them automatically.
+
+A confirmation modal shows the param diff before commit. The Settings
+page has an **Active Config** card summarizing what's live, with a
+**Reset to env defaults** button to revert.
+
+API endpoints (you can call these directly too):
+
+```bash
+curl -s localhost:8000/api/v1/config/active | jq
+curl -XPOST localhost:8000/api/v1/config/apply \
+  -H 'Content-Type: application/json' \
+  -d '{"params":{"momentum.min_rvol":2.5,"engine.trail_after_r":1.5}}'
+curl -XPOST localhost:8000/api/v1/config/reset-defaults
+```
+
 ### Strategy-level sweep
 
 The same sweep also tunes per-strategy parameters (RSI oversold threshold,
@@ -274,11 +303,50 @@ Metrics exposed:
 | Counter | `scalper_errors_total` | `level` |
 | Histogram | `scalper_scan_duration_seconds` | – |
 
+### Suggested alert rules
+
+Wire these into a Prometheus rules file once you go to paper trading 24/7:
+
+| Expr | When to fire | Severity |
+|---|---|---|
+| `scalper_broker_connected == 0` for 30s | broker socket dead | **page** |
+| `rate(scalper_errors_total{level="error"}[5m]) > 0.1` | error storm | warn |
+| `scalper_circuit_breaker_tripped == 1` | day flatlined | info |
+| `histogram_quantile(0.95, sum(rate(scalper_scan_duration_seconds_bucket[5m])) by (le)) > 5` | scanner falling behind | warn |
+| `(scalper_realized_loss_total_dollars - scalper_realized_loss_total_dollars offset 1d) > $YOUR_DAILY_LOSS_LIMIT` | breached daily loss cap | **page** |
+| `rate(scalper_signals_total[15m]) == 0` during RTH | no activity at all (data feed dead?) | warn |
+
+Cardinality discipline: every label set is small and finite
+(strategy ∈ 3, side ∈ 2, reason ∈ 5, rule ∈ ~10, level ∈ 4).
+Adding new metrics: define in `backend/app/observability/metrics.py` and
+subscribe to the relevant event in `MetricsRecorder.start()`.
+
 ## Tests
 
 ```bash
 docker compose exec backend pytest -q
 ```
+
+## First-day paper trading
+
+There's a complete walkthrough in [`docs/RUNBOOK.md`](docs/RUNBOOK.md) —
+`.env` setup, smoke-test interpretation, what to watch on the dashboards,
+how to read the first signal/fill/close cycle, and a troubleshooting
+matrix.
+
+Quick sequence:
+
+```bash
+cp .env.example .env                          # fill in IB_USERID / IB_PASSWORD
+docker compose up -d postgres redis ib-gateway
+docker compose logs -f ib-gateway             # wait for "API server listening"
+docker compose up -d backend worker frontend prometheus grafana
+
+# Verify every surface is healthy before relying on it:
+docker compose exec backend python -m app.cli.smoke_test --symbol AAPL
+```
+
+Expect 9 PASS rows. If any FAIL, **do not trade** until resolved.
 
 ## Going live (don't do this until you've paper-traded for a week)
 
